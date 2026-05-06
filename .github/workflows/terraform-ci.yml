@@ -1,0 +1,139 @@
+name: Terraform Module CI
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        description: 'Pull request number'
+        required: true
+        type: number
+      terraform_version:
+        description: 'Terraform version constraint'
+        required: false
+        type: string
+        default: '~1.5'
+      tflint_version:
+        description: 'tflint version'
+        required: false
+        type: string
+        default: 'latest'
+      terraform_docs_version:
+        description: 'terraform-docs version'
+        required: false
+        type: string
+        default: 'v0.18.0'
+      go_version_file:
+        description: 'Path to go.mod for Go version resolution'
+        required: false
+        type: string
+        default: 'test/go.mod'
+      localstack_image_tag:
+        description: 'LocalStack Docker image tag'
+        required: false
+        type: string
+        default: 'latest'
+      localstack_services:
+        description: 'Comma-separated list of LocalStack services to enable'
+        required: false
+        type: string
+        default: 'ec2'
+    secrets:
+      LOCALSTACK_AUTH_TOKEN:
+        required: false
+
+jobs:
+  label-pr:
+    name: Ensure Version Label
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Apply default patch label if no version label present
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const versionLabels = ['patch', 'minor', 'major'];
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: ${{ inputs.pr_number }}
+            });
+            const labels = pr.labels.map(l => l.name);
+            const hasVersionLabel = labels.some(l => versionLabels.includes(l));
+            if (!hasVersionLabel) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: ${{ inputs.pr_number }},
+                labels: ['patch'],
+              });
+              core.info('No version label found — applied default "patch" label.');
+            } else {
+              core.info(`Version label already present: ${labels.filter(l => versionLabels.includes(l)).join(', ')}`);
+            }
+
+  static-validation:
+    name: Static Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+
+      - name: Install tflint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ inputs.tflint_version }}
+
+      - name: Install terraform-docs
+        run: |
+          TERRAFORM_DOCS_VERSION=${{ inputs.terraform_docs_version }}
+          curl -sSLo /tmp/terraform-docs.tar.gz \
+            "https://github.com/terraform-docs/terraform-docs/releases/download/${TERRAFORM_DOCS_VERSION}/terraform-docs-${TERRAFORM_DOCS_VERSION}-linux-amd64.tar.gz"
+          tar -xzf /tmp/terraform-docs.tar.gz -C /tmp
+          chmod +x /tmp/terraform-docs
+          sudo mv /tmp/terraform-docs /usr/local/bin/
+
+      - name: Run static checks
+        run: make static-check
+
+  terratest:
+    name: Terratest
+    runs-on: ubuntu-latest
+    env:
+      LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.terraform_version }}
+          terraform_wrapper: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ inputs.go_version_file }}
+
+      - name: Start LocalStack
+        uses: LocalStack/setup-localstack@v0.2.3
+        with:
+          image-tag: ${{ inputs.localstack_image_tag }}
+          use-pro: "false"
+          install-awslocal: "true"
+          configuration: SERVICES=${{ inputs.localstack_services }}
+        env:
+          LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+
+      - name: Run Terratest
+        run: make terratest
+
+      - name: Dump LocalStack logs
+        if: failure()
+        run: localstack logs

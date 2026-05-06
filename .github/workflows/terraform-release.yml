@@ -1,0 +1,116 @@
+name: Terraform Module Release
+
+on:
+  workflow_call:
+
+jobs:
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect PR labels
+        id: pr-labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: prs } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha
+            });
+
+            const mergedPR = prs.find(pr => pr.merged_at !== null);
+
+            if (!mergedPR) {
+              core.setOutput('bump', 'patch');
+              return;
+            }
+
+            const labels = mergedPR.labels.map(l => l.name);
+
+            if (labels.includes('major')) {
+              core.setOutput('bump', 'major');
+            } else if (labels.includes('minor')) {
+              core.setOutput('bump', 'minor');
+            } else {
+              core.setOutput('bump', 'patch');
+            }
+
+      - name: Calculate next version
+        id: version
+        run: |
+          LATEST_TAG=$(git tag --sort=-version:refname | grep '^v' | head -1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            NEXT_VERSION="v0.1.0"
+          else
+            VERSION=${LATEST_TAG#v}
+            MAJOR=$(echo "$VERSION" | cut -d. -f1)
+            MINOR=$(echo "$VERSION" | cut -d. -f2)
+            PATCH=$(echo "$VERSION" | cut -d. -f3)
+
+            BUMP="${{ steps.pr-labels.outputs.bump }}"
+
+            if [ "$BUMP" = "major" ]; then
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+            elif [ "$BUMP" = "minor" ]; then
+              MINOR=$((MINOR + 1))
+              PATCH=0
+            else
+              PATCH=$((PATCH + 1))
+            fi
+
+            NEXT_VERSION="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          echo "version=$NEXT_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Next version: $NEXT_VERSION"
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          LATEST_TAG=$(git tag --sort=-version:refname | grep '^v' | head -1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            git log --pretty=format:"- %s (%h)" HEAD > changelog.txt
+          else
+            git log --pretty=format:"- %s (%h)" "${LATEST_TAG}..HEAD" > changelog.txt
+          fi
+
+          echo "Changelog:"
+          cat changelog.txt
+
+      - name: Create GitHub Release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const version = '${{ steps.version.outputs.version }}';
+            const changelog = fs.readFileSync('changelog.txt', 'utf8');
+
+            await github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: `refs/tags/${version}`,
+              sha: context.sha
+            });
+
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: version,
+              name: `Release ${version}`,
+              body: `## What's Changed\n\n${changelog}`,
+              draft: false,
+              prerelease: false
+            });
